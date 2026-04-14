@@ -578,6 +578,13 @@ static int run_supervisor(const char *rootfs)
     ctx.server_fd = -1;
     ctx.monitor_fd = -1;
 
+    // FIX 1: Open the kernel monitor device
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("open /dev/container_monitor (is monitor.ko loaded?)");
+        // Not fatal — continue without kernel monitoring
+    }
+
     rc = pthread_mutex_init(&ctx.metadata_lock, NULL);
     if (rc != 0) {
         errno = rc;
@@ -713,16 +720,93 @@ static int run_supervisor(const char *rootfs)
                 pthread_create(&reader_thread, NULL, pipe_reader_thread, args);
                                 // Wait if RUN
 
+                // Register with kernel monitor
+                if (ctx.monitor_fd >= 0) {
+                    register_with_monitor(ctx.monitor_fd, req.container_id, pid,
+                                          req.soft_limit_bytes, req.hard_limit_bytes);
+                }
+
                 snprintf(resp.message, sizeof(resp.message),
-                        "Container %s exited", req.container_id);
+                        "Container %s started (PID=%d)", req.container_id, pid);
 
                 break;
             }
 
-        case CMD_START:
+        case CMD_START: {
+            // FIX 2: Actually launch the container in the background (no waitpid)
+            int pipefd_s[2];
+            if (pipe(pipefd_s) < 0) {
+                perror("pipe");
+                snprintf(resp.message, sizeof(resp.message), "ERROR: pipe failed for %s", req.container_id);
+                break;
+            }
+            void *stack_s = malloc(STACK_SIZE);
+            if (!stack_s) {
+                free(stack_s);
+                close(pipefd_s[0]); close(pipefd_s[1]);
+                snprintf(resp.message, sizeof(resp.message), "ERROR: malloc failed");
+                break;
+            }
+            child_config_t *config_s = malloc(sizeof(child_config_t));
+            if (!config_s) {
+                free(stack_s);
+                close(pipefd_s[0]); close(pipefd_s[1]);
+                snprintf(resp.message, sizeof(resp.message), "ERROR: malloc failed");
+                break;
+            }
+            memset(config_s, 0, sizeof(*config_s));
+            strncpy(config_s->id, req.container_id, sizeof(config_s->id) - 1);
+            strncpy(config_s->rootfs, req.rootfs, sizeof(config_s->rootfs) - 1);
+            strncpy(config_s->command, req.command, sizeof(config_s->command) - 1);
+            config_s->nice_value = req.nice_value;
+            config_s->log_write_fd = pipefd_s[1];
+
+            int flags_s = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+            pid_t pid_s = clone(child_fn, (char *)stack_s + STACK_SIZE, flags_s, config_s);
+            if (pid_s < 0) {
+                perror("clone");
+                free(stack_s); free(config_s);
+                close(pipefd_s[0]); close(pipefd_s[1]);
+                snprintf(resp.message, sizeof(resp.message), "ERROR: clone failed for %s", req.container_id);
+                break;
+            }
+            close(pipefd_s[1]); // parent closes write end
+
+            // Add metadata record
+            container_record_t *rec_s = malloc(sizeof(container_record_t));
+            memset(rec_s, 0, sizeof(*rec_s));
+            strncpy(rec_s->id, req.container_id, CONTAINER_ID_LEN - 1);
+            rec_s->host_pid = pid_s;
+            rec_s->started_at = time(NULL);
+            rec_s->state = CONTAINER_RUNNING;
+            rec_s->soft_limit_bytes = req.soft_limit_bytes;
+            rec_s->hard_limit_bytes = req.hard_limit_bytes;
+
+            pthread_mutex_lock(&ctx.metadata_lock);
+            rec_s->next = ctx.containers;
+            ctx.containers = rec_s;
+            pthread_mutex_unlock(&ctx.metadata_lock);
+
+            // Register with kernel monitor
+            if (ctx.monitor_fd >= 0) {
+                register_with_monitor(ctx.monitor_fd, req.container_id, pid_s,
+                                      req.soft_limit_bytes, req.hard_limit_bytes);
+            }
+
+            // Start pipe reader thread for logging
+            pipe_args_t *args_s = malloc(sizeof(pipe_args_t));
+            args_s->fd = pipefd_s[0];
+            args_s->ctx = &ctx;
+            strncpy(args_s->container_id, req.container_id, CONTAINER_ID_LEN);
+            pthread_t reader_s;
+            pthread_create(&reader_s, NULL, pipe_reader_thread, args_s);
+            pthread_detach(reader_s);
+
+            printf("🚀 [START] Container %s launched (PID=%d)\n", req.container_id, pid_s);
             snprintf(resp.message, sizeof(resp.message),
-                     "START command received for container %s", req.container_id);
+                     "Container %s started (PID=%d)", req.container_id, pid_s);
             break;
+        }
 
         case CMD_PS:
             pthread_mutex_lock(&ctx.metadata_lock);
@@ -750,14 +834,63 @@ static int run_supervisor(const char *rootfs)
             resp.message[sizeof(resp.message) - 1] = '\0';
             break;
 
-        case CMD_STOP:
-            snprintf(resp.message, sizeof(resp.message),
-                     "STOP command received for %s", req.container_id);
+        case CMD_STOP: {
+            // FIX 3: Find the container record and send SIGTERM
+            pthread_mutex_lock(&ctx.metadata_lock);
+            container_record_t *stop_cur = ctx.containers;
+            int stop_found = 0;
+            while (stop_cur) {
+                if (strncmp(stop_cur->id, req.container_id, CONTAINER_ID_LEN) == 0) {
+                    if (stop_cur->state == CONTAINER_RUNNING) {
+                        stop_cur->state = CONTAINER_STOPPED; // mark stop_requested
+                        kill(stop_cur->host_pid, SIGTERM);
+                        if (ctx.monitor_fd >= 0) {
+                            unregister_from_monitor(ctx.monitor_fd, stop_cur->id, stop_cur->host_pid);
+                        }
+                        snprintf(resp.message, sizeof(resp.message),
+                                 "Container %s (PID=%d) sent SIGTERM", req.container_id, stop_cur->host_pid);
+                    } else {
+                        snprintf(resp.message, sizeof(resp.message),
+                                 "Container %s is not running (state=%s)",
+                                 req.container_id, state_to_string(stop_cur->state));
+                    }
+                    stop_found = 1;
+                    break;
+                }
+                stop_cur = stop_cur->next;
+            }
+            pthread_mutex_unlock(&ctx.metadata_lock);
+            if (!stop_found) {
+                snprintf(resp.message, sizeof(resp.message),
+                         "Container %s not found", req.container_id);
+            }
             break;
+        }
+
+        case CMD_LOGS: {
+            // FIX 4: Read and return the container's log file
+            char log_path[PATH_MAX];
+            snprintf(log_path, sizeof(log_path), "%s/%s.log", LOG_DIR, req.container_id);
+
+            FILE *lf = fopen(log_path, "r");
+            if (!lf) {
+                snprintf(resp.message, sizeof(resp.message),
+                         "No log file found for container %s (looked at %s)",
+                         req.container_id, log_path);
+            } else {
+                size_t n_read = fread(resp.message, 1, sizeof(resp.message) - 1, lf);
+                resp.message[n_read] = '\0';
+                fclose(lf);
+                if (n_read == 0) {
+                    snprintf(resp.message, sizeof(resp.message),
+                             "(log file for %s is empty)", req.container_id);
+                }
+            }
+            break;
+        }
 
         default:
-            snprintf(resp.message, sizeof(resp.message),
-                     "Unknown command");
+            snprintf(resp.message, sizeof(resp.message), "Unknown command");
             break;
         }
 
