@@ -125,10 +125,10 @@ sudo dmesg | tail -5    # confirm module unloaded cleanly
 
 Two containers (`alpha` PID=5388, `beta` PID=5399) launched under a single supervisor process. The supervisor terminal (left) shows both containers started and reaped after exit. The client terminal (right) shows the `run` commands completing.
 
-![alt text](Screenshot%20from%202026-04-14%2019-02-51-1.png)
+![alt text](Screenshot from 2026-04-14 19-02-51-1.png)
 
 
-![alt text](Screenshot%20from%202026-04-14%2018-54-42.png)
+![alt text](Screenshot from 2026-04-14 18-54-42.png)
 
 **Caption:** Supervisor managing two concurrent containers (alpha and beta) with different workloads — `cpu_hog` and `io_pulse`. Both PIDs appear in the supervisor's reap log, confirming no zombies.
 
@@ -137,7 +137,7 @@ Two containers (`alpha` PID=5388, `beta` PID=5399) launched under a single super
 ### Screenshot 2 — Metadata Tracking (`ps` output)
 
 `sudo ./engine ps` returns the tracked container table including ID, PID, STATE, and start timestamp for both alpha and beta.
-![alt text](Screenshot%20from%202026-04-14%2018-59-24-1.png)
+![alt text](Screenshot from 2026-04-14 18-59-24-1.png)
 
 **Caption:** `engine ps` output showing both containers in `exited` state after completion. State transitions (starting → running → exited) are maintained in the supervisor's linked metadata list.
 
@@ -147,7 +147,7 @@ Two containers (`alpha` PID=5388, `beta` PID=5399) launched under a single super
 
 `sudo ./engine logs alpha` returns content written by the container's stdout, captured through the pipe → producer thread → bounded buffer → consumer thread → log file pipeline.
 
-![alt text](Screenshot%20from%202026-04-14%2018-46-30.png)
+![alt text](Screenshot from 2026-04-14 18-46-30.png)
 
 **Caption:** Log file content for container `alpha` returned by `engine logs`. The output (Alpine rootfs directory listing) was written by the container to stdout, captured via a pipe by the supervisor's producer thread, buffered in the bounded buffer, and written to `logs/alpha.log` by the consumer thread.
 
@@ -157,7 +157,7 @@ Two containers (`alpha` PID=5388, `beta` PID=5399) launched under a single super
 
 The supervisor terminal shows it receiving typed commands (command kind numbers and container IDs), and the client terminal shows responses arriving back over the UNIX domain socket.
 
-![alt text](Screenshot%20from%202026-04-14%2019-00-09.png)
+![alt text](Screenshot from 2026-04-14 19-00-09.png)
 
 **Caption:** Supervisor (left) prints received command type and container ID for each CLI invocation. The client (right) prints the supervisor's response. The IPC path uses a UNIX domain socket at `/tmp/mini_runtime.sock`, distinct from the logging pipes.
 
@@ -166,7 +166,7 @@ The supervisor terminal shows it receiving typed commands (command kind numbers 
 ### Screenshot 5 — Soft-Limit Warning
 
 `sudo dmesg | tail -20` after running `memory_hog` with `--soft-mib 20 --hard-mib 30` shows a `SOFT LIMIT` kernel warning emitted by `monitor.ko` when the process's RSS exceeded 20 MiB.
-![alt text](<Screenshot from 2026-04-19 19-03-24.png>)
+![alt text](Screenshot from 2026-04-19 19-03-24.png)
 
 **Caption:** Kernel module emitting a `SOFT LIMIT` warning via `printk` when the monitored container's RSS crossed the 20 MiB threshold. The soft-limit flag is set so the warning fires only once per container.
 
@@ -182,7 +182,7 @@ The supervisor terminal shows it receiving typed commands (command kind numbers 
 
 **Caption:** Kernel module sending `SIGKILL` to the container after RSS exceeded the 30 MiB hard limit. The supervisor reaps the child via `SIGCHLD` and records `exit_signal = 9`. The `ps` command would show the container in `exited` state with the hard-limit kill reason.
 
-![alt text](<Screenshot from 2026-04-19 19-11-12.png>)
+![alt text](Screenshot from 2026-04-19 19-11-12.png)
 > **Note:** If `dmesg` returns "Operation not permitted", re-run as `sudo dmesg | tail -20`.
 
 ---
@@ -191,7 +191,7 @@ The supervisor terminal shows it receiving typed commands (command kind numbers 
 
 Two containers both running `cpu_hog` — one with `--nice 0` (default priority) and one with `--nice 10` (lower priority). Wall-clock time measured with `time`.
 
-![alt text](Screenshot%20from%202026-04-14%2018-49-50.png)
+![alt text](Screenshot from 2026-04-14 18-49-50.png)
 
 **Caption:** `cpu1` (nice=0) completed in 0.048s real time; `cpu2` (nice=10) took 0.083s real time. Linux's CFS scheduler awarded more CPU time to the higher-priority (lower nice value) process, consistent with the weight-based scheduling model. See Section 6 for full analysis.
 
@@ -202,11 +202,9 @@ Two containers both running `cpu_hog` — one with `--nice 0` (default priority)
 `ps aux | grep engine` after stopping all containers shows only the supervisor process remains (no zombie children). `sudo rmmod monitor` succeeds and `dmesg` confirms clean unload.
 
 **Caption:** After `engine stop` on all containers, `ps aux | grep engine` shows only the long-running supervisor. `rmmod monitor` unloads the kernel module cleanly; `dmesg` shows the "Module unloaded" message. All kernel list entries were freed in `monitor_exit()`.
-
-![alt text](<Screenshot from 2026-04-19 19-03-24.png>)
 ---
 
-## 4. Engineering Analysis
+## 4. Engineering Analysis![alt text](<Screenshot from 2026-04-19 19-11-12-1.png>)
 
 ### 4.1 Isolation Mechanisms
 
