@@ -166,7 +166,8 @@ The supervisor terminal shows it receiving typed commands (command kind numbers 
 ### Screenshot 5 — Soft-Limit Warning
 
 `sudo dmesg | tail -20` after running `memory_hog` with `--soft-mib 20 --hard-mib 30` shows a `SOFT LIMIT` kernel warning emitted by `monitor.ko` when the process's RSS exceeded 20 MiB.
-![alt text](Screenshot%20from%202026-04-19%2019-03-24.png)
+
+![alt text](Screenshot%20from%202026-04-14%2019-03-26.png)
 
 **Caption:** Kernel module emitting a `SOFT LIMIT` warning via `printk` when the monitored container's RSS crossed the 20 MiB threshold. The soft-limit flag is set so the warning fires only once per container.
 
