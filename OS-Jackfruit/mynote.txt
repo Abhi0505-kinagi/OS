@@ -1,0 +1,760 @@
+
+
+## Complete Run Guide —
+
+This assumes you're on **Ubuntu 22.04/24.04 VM** with Secure Boot OFF. Everything below uses your exact folder structure (`~/OS-Jackfruit/boilerplate/`).
+
+---
+
+### Step 1 — Install Dependencies
+
+```bash
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r)
+```
+
+---
+
+### Step 2 — Go to Your Project Folder
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+```
+
+---
+
+### Step 3 — Build Everything
+
+```bash
+make
+```
+
+This compiles `engine`, `cpu_hog`, `io_pulse`, `memory_hog`, and builds `monitor.ko`.
+
+Verify the files exist:
+```bash
+ls -l engine cpu_hog io_pulse memory_hog monitor.ko
+```
+
+---
+
+### Step 4 — Prepare the Root Filesystems
+
+```bash
+# Create base rootfs (only do this once)
+mkdir -p rootfs-base
+wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+
+# Create per-container copies
+cp -a rootfs-base rootfs-alpha
+cp -a rootfs-base rootfs-beta
+
+# Copy workload binaries INTO the rootfs (THIS is why you got execvp errors before)
+cp ./cpu_hog    ./rootfs-alpha/
+cp ./memory_hog ./rootfs-alpha/
+cp ./io_pulse   ./rootfs-beta/
+```
+
+
+---
+
+### Step 5 — Load the Kernel Module
+
+```bash
+sudo insmod monitor.ko
+
+# Verify it loaded
+lsmod | grep monitor
+
+# Verify the device was created
+ls -l /dev/container_monitor
+```
+
+---
+
+### Step 6 — Open Two Terminals
+
+You need **Terminal 1** (supervisor) and **Terminal 2** (CLI commands). Keep them side by side.
+
+---
+
+### Terminal 1 — Start the Supervisor
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+sudo ./engine supervisor ./rootfs-base
+```
+
+Leave this running. You'll see:
+```
+✅ Supervisor running... waiting for commands
+```
+
+---
+
+### Terminal 2 — Run Everything From Here
+
+#### Launch two containers:
+```bash
+cd ~/OS-Jackfruit/boilerplate
+sudo ./engine run alpha ./rootfs-alpha "/cpu_hog" &
+sudo ./engine run beta  ./rootfs-beta  "/io_pulse" &
+```
+
+#### Check metadata (ps):
+```bash
+sudo ./engine ps
+```
+You should see both containers with ID, PID, STATE, TIME.
+
+#### Read logs:
+```bash
+sudo ./engine logs alpha
+```
+
+#### Stop containers:
+```bash
+sudo ./engine stop alpha
+sudo ./engine stop beta
+```
+
+---
+
+### Step 7 — Memory Limit Test (Fix for Screenshots 5 & 6)
+
+This is the most important fix. Run these commands **in order, exactly**:
+
+```bash
+# Terminal 2:
+sudo ./engine run memleak ./rootfs-alpha "/memory_hog" --soft-mib 20 --hard-mib 30 &
+
+# Wait 3 seconds
+sleep 3
+
+# THIS is the correct command - always use sudo
+sudo dmesg | tail -20
+```
+
+You should see lines like:
+```
+[kernel] SOFT LIMIT: container PID XXXX RSS exceeded 20 MiB
+[kernel] HARD LIMIT: sending SIGKILL to PID XXXX
+```
+
+Then immediately check:
+```bash
+sudo ./engine ps
+```
+The `memleak` container should show state `killed` or `exited`.
+
+> ⚠️ The reason your screenshots showed nothing from dmesg was `dmesg: read kernel buffer failed: Operation not permitted` — you forgot `sudo`. Always use `sudo dmesg`.
+
+---
+
+### Step 8 — Scheduling Experiment (Screenshot 7)
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+
+# Run both concurrently and time them
+time sudo ./engine run cpu1 ./rootfs-alpha "/cpu_hog" --nice 0  &
+time sudo ./engine run cpu2 ./rootfs-beta  "/cpu_hog" --nice 10 &
+wait
+```
+
+You'll see real-time differences between cpu1 and cpu2.
+
+---
+
+### Step 9 — Clean Teardown (Screenshot 8)
+
+```bash
+# Stop all containers
+sudo ./engine stop alpha
+sudo ./engine stop beta
+
+# Check no zombies (use this exact command, not ps auz)
+ps aux | grep engine
+
+# Kill the supervisor (Ctrl+C in Terminal 1, or:)
+sudo kill $(pgrep -f "engine supervisor")
+
+# Unload module (make sure no ioctl handles are open first)
+sudo rmmod monitor
+
+# Confirm clean unload - always with sudo
+sudo dmesg | tail -5
+```
+
+
+Project archeticture:
+
+---
+
+### 🔷 Topic 1: Namespaces & Isolation
+
+**Q: What is the difference between `fork()` and `clone()` in your project?**
+
+A: `fork()` creates a child that shares the same namespaces as the parent. `clone()` lets you pass flags like `CLONE_NEWPID`, `CLONE_NEWNS`, `CLONE_NEWUTS` to create the child in *new* namespaces. That's why we use `clone()` — so each container gets isolated PID, mount, and UTS namespaces.
+
+**Q: What does `CLONE_NEWPID` actually do? Does the container's process really become PID 1?**
+
+A: Yes. From inside the container, the first process created with `CLONE_NEWPID` sees itself as PID 1. But from the host, it has a real host PID like 5388. The kernel maintains a two-level PID mapping. This means a container cannot see or signal host processes.
+
+**Q: Why did you use `chroot()` instead of `pivot_root`?**
+
+A: `chroot()` is simpler and sufficient for this project scope. The difference is that `pivot_root` actually changes the root mount point and the old root is unmounted, making escape via `..` traversal impossible. `chroot()` is vulnerable to a root process escaping by doing `chroot()` again from inside. But since our containers don't run as untrusted code and the project doesn't require full security, `chroot()` is adequate.
+
+**Q: What does the host kernel still share with all containers?**
+
+A: The kernel itself — all containers run on the same kernel. Also: cgroups (unless explicitly set), network namespace (since we didn't use `CLONE_NEWNET`), user namespace, and kernel memory. A kernel panic in one container crashes the entire system.
+
+---
+
+### 🔷 Topic 2: Supervisor & Process Lifecycle
+
+**Q: Why do we need a long-running supervisor? Can't we just `fork()` and exit?**
+
+A: If the parent exits after launching a container, the container becomes an orphan and gets re-parented to `init` (PID 1). We lose all metadata about it — we can't track its state, read its logs, or stop it via our CLI. The supervisor stays alive specifically to `waitpid()` on children, reap them, and maintain their metadata.
+
+**Q: What is a zombie process? How does your supervisor prevent them?**
+
+A: When a child exits, the kernel keeps a small entry in the process table with its exit code until the parent calls `waitpid()`. This is a zombie — it's dead but not reaped. Our supervisor installs a `SIGCHLD` handler that calls `waitpid(-1, &status, WNOHANG)` in a loop to reap all exited children immediately. `WNOHANG` means it doesn't block if no child has exited yet.
+
+**Q: Why do you use `WNOHANG` inside a loop rather than just calling `waitpid()` once?**
+
+A: Signals can coalesce. If two children exit almost simultaneously, the OS might deliver only one `SIGCHLD`. If we call `waitpid()` only once, we reap one and the other becomes a zombie. The loop keeps calling until `waitpid()` returns 0 (no more exited children).
+
+**Q: What happens when the supervisor itself receives `SIGTERM` or `SIGINT`?**
+
+A: It should perform orderly shutdown — stop all containers, join all logging threads, close file descriptors, and exit cleanly. Our README describes this in the teardown section.
+
+---
+
+### 🔷 Topic 3: IPC & Bounded Buffer
+
+**Q: You use two IPC mechanisms. Explain them and why they're separate.**
+
+A: Path A is **pipes** for logging — each container's stdout/stderr goes into a pipe, the supervisor's producer thread reads from the pipe and pushes into the bounded buffer, the consumer thread writes to a log file. Path B is a **UNIX domain socket** at `/tmp/mini_runtime.sock` for control commands like `ps`, `start`, `stop`, `logs`. They're separate because logging is a continuous stream (needs buffering), while control is request-response (needs bidirectional communication). Mixing them would complicate parsing.
+
+**Q: What is a bounded buffer and why is it bounded?**
+
+A: A bounded buffer is a fixed-size circular queue shared between producer and consumer threads. It's bounded to limit memory usage — if it were unbounded, a container flooding stdout could eat all memory. When the buffer is full, producers block. When it's empty, the consumer blocks. This is the classic producer-consumer problem.
+
+**Q: What race condition would exist without the mutex on the bounded buffer?**
+
+A: Two producer threads (one per container) could both read `buf->head`, both decide to write to the same slot, and both increment `head`. Result: one chunk is overwritten, `head` is only incremented once — data corruption and wrong count. The mutex ensures only one thread manipulates the buffer at a time.
+
+**Q: Why did you use condition variables instead of a semaphore for the bounded buffer?**
+
+A: A semaphore can signal "slots available" or "items available" but you'd need two semaphores plus a mutex. Condition variables combine naturally with the mutex we already have, and a single `pthread_cond_wait` call atomically releases the mutex and sleeps — no busy-waiting, no TOCTOU gap. It's cleaner for this use case.
+
+---
+
+### 🔷 Topic 4: Kernel Module
+
+**Q: What is RSS and what doesn't it measure?**
+
+A: RSS (Resident Set Size) is the number of physical memory pages currently mapped and present in RAM for a process. It does *not* include: pages that have been swapped to disk, memory-mapped files not yet faulted in, and shared library pages counted once on the system but per-process in RSS. So it can overcount (shared libs) or undercount (swapped pages).
+
+**Q: Why does memory enforcement belong in kernel space rather than user space?**
+
+A: A user-space monitor polls at some interval. A process that allocates memory rapidly could cross the hard limit and cause OOM *between polls*. More critically, a malicious process can see the user-space monitor and slow down just before a poll. In kernel space, the timer runs regardless, and `send_sig(SIGKILL, ...)` cannot be blocked or masked by the monitored process — `SIGKILL` is always delivered.
+
+**Q: What's the difference between a soft limit and a hard limit? Why have both?**
+
+A: Soft limit is a warning — it fires once when RSS first exceeds the threshold, logs a `printk` message, but lets the process continue. It gives operators early notice. Hard limit is enforcement — when RSS exceeds this, the process is sent `SIGKILL` unconditionally. Having both allows a grace period to investigate before killing.
+
+**Q: Why do you use a mutex (not a spinlock) to protect the kernel linked list?**
+
+A: Our timer callback runs at 1 Hz (slow frequency) and needs to iterate the entire list, which takes some time. A spinlock disables preemption for the entire iteration, increasing system latency. A mutex allows the scheduler to context-switch during the wait. Since we're not in interrupt context (we use a timer in process context via `mod_timer`), a mutex is safe and more appropriate.
+
+**Q: How does the supervisor tell the kernel module which PIDs to monitor?**
+
+A: Via `ioctl()`. The supervisor opens `/dev/container_monitor` and calls `ioctl(fd, MONITOR_IOC_ADD, &info)` where `info` contains the container's host PID and its soft/hard limits. The kernel module receives this in its `ioctl` handler, allocates a new list entry, and adds it to the monitored list under the mutex.
+
+---
+
+### 🔷 Topic 5: Scheduling
+
+**Q: Explain your scheduling experiment result — why did nice=0 finish faster than nice=10?**
+
+A: Linux's CFS (Completely Fair Scheduler) assigns each task a *weight* based on its nice value. Nice=0 has weight 1024, nice=10 has weight ~110. When both tasks are runnable at the same time, CFS distributes CPU time proportional to weight — approximately a 9:1 ratio. So `cpu_hog` at nice=0 gets ~9x more CPU time per scheduling period, finishes faster.
+
+**Q: Your result shows only 1.7x difference, not 9x. Why?**
+
+A: Because these workloads are very short-lived (under 100ms). A significant fraction of their wall-clock time is spent in process setup — `clone()`, namespace initialization, `chroot()`, `exec()` — which runs sequentially and is unaffected by nice-based priority. For workloads running for seconds or minutes, the ratio would approach the theoretical 9:1.
+
+**Q: What is CFS? How does it decide who runs next?**
+
+A: Completely Fair Scheduler is Linux's default process scheduler since kernel 2.6.23. It tracks `vruntime` (virtual runtime) for each task — a measure of how much CPU time it has consumed, weighted by priority. The task with the lowest `vruntime` always runs next. This ensures each task gets a "fair" share proportional to its weight. Tasks are stored in a red-black tree keyed by `vruntime` for O(log n) scheduling decisions.
+
+---
+
+### 🔷 Topic 6: Design Tradeoffs (Mentor loves these)
+
+**Q: Why did you not implement network namespace isolation?**
+
+A: `CLONE_NEWNET` requires setting up virtual Ethernet pairs (veth), a bridge, and IP routing to give the container actual network connectivity. This is significant additional complexity outside the project scope. Without it, containers share the host network stack and could conflict on ports, but for our demo workloads (`cpu_hog`, `memory_hog`, `io_pulse`) this isn't a concern.
+
+**Q: Your supervisor handles one CLI command at a time. What's the limitation?**
+
+A: A slow command like `logs` that reads a large log file will block subsequent CLI commands until it finishes. In a production system you'd use a thread per connection or an event loop with non-blocking I/O. We chose single-threaded command handling because it eliminates race conditions between concurrent command handlers accessing the same metadata list — simpler to reason about and debug for this project.
+
+**Q: What would happen if you didn't mount `/proc` inside the container?**
+
+A: Tools like `ps`, `top`, `cat /proc/meminfo` inside the container would fail because `/proc` is a virtual filesystem that the kernel populates dynamically. Without `mount("proc", "/proc", "proc", 0, NULL)` inside the child's namespace, `/proc` would either be empty or not exist, and any tool that reads process information would break.
+
+---
+
+### 🔷 Tricky/Deep Questions
+
+**Q: Can a container escape the `chroot` jail? How?**
+
+A: Yes, if it runs as root. A process can call `mkdir("/tmp/escape")`, `chroot("/tmp/escape")`, then traverse `../../..` to reach the real host root. `pivot_root` prevents this by actually dismounting the old root. In our project we acknowledge this limitation and note that `chroot` is sufficient for our scope.
+
+**Q: What is `WNOHANG` vs blocking `waitpid`? Why must you use `WNOHANG` inside a signal handler?**
+
+A: Blocking `waitpid()` without `WNOHANG` would suspend the signal handler until a child exits, freezing the supervisor's main loop. Signal handlers must complete quickly and not block. `WNOHANG` returns immediately if no child has exited, allowing the handler to return and the supervisor to continue operating.
+
+**Q: If two containers exit simultaneously, will your supervisor handle both correctly?**
+
+A: Yes, because of the `while` loop in the `SIGCHLD` handler. Even if only one `SIGCHLD` is delivered, the loop calls `waitpid(-1, WNOHANG)` repeatedly until it returns 0, reaping all exited children in one handler invocation.
+
+
+====================================================================================
+## `engine.c` — The User Space Runtime
+
+Think of this as your **mini Docker**. It has two personalities:
+
+**Supervisor** — long-running process that manages containers
+**CLI client** — short-lived process that sends commands to supervisor
+
+---
+
+### The Data Structures (understand these first)
+
+```c
+container_record_t   // one entry per container — tracks id, pid, state, limits, log path
+bounded_buffer_t     // the shared queue between producer and consumer threads
+control_request_t    // what CLI sends to supervisor (start/run/ps/logs/stop)
+control_response_t   // what supervisor sends back
+child_config_t       // config passed into the container process at birth
+supervisor_ctx_t     // the supervisor's entire world — socket, monitor fd, buffer, metadata list
+```
+
+---
+
+### The IPC Flow (2 separate paths)
+
+```
+PATH A — Logging (pipe → bounded buffer → log file)
+  container stdout → pipe → pipe_reader_thread (producer) → bounded_buffer → logging_thread (consumer) → logs/alpha.log
+
+PATH B — Control (UNIX socket)
+  CLI client → connect to /tmp/mini_runtime.sock → write control_request_t → read control_response_t
+  Supervisor → accept() → read request → handle → write response
+```
+
+---
+
+### TODO Parts in `engine.c` — What Each Does
+
+**1. `bounded_buffer_push()` — Producer inserts a log chunk**
+
+```c
+// What it does:
+// 1. Lock the mutex
+// 2. If buffer is FULL → sleep (pthread_cond_wait on not_full) until consumer makes space
+// 3. Once space available → copy item into buffer[tail], advance tail, increment count
+// 4. Signal consumer (not_empty) that data is available
+// 5. Unlock
+```
+
+Why mutex + cond vars? Without the mutex, two producer threads (one per container) could both write to `buffer->tail` at the same moment → data corruption. The `pthread_cond_wait` atomically releases the lock AND sleeps — no busy waiting.
+
+**2. `bounded_buffer_pop()` — Consumer removes a log chunk**
+
+```c
+// What it does:
+// 1. Lock the mutex
+// 2. If buffer is EMPTY → sleep (pthread_cond_wait on not_empty) until producer adds data
+// 3. Once data available → copy item from buffer[head], advance head, decrement count
+// 4. Signal producers (not_full) that space is free
+// 5. Unlock
+// Special: if shutting_down AND count==0 → return -1 to exit the consumer
+```
+
+**3. `logging_thread()` — The consumer thread**
+
+```c
+// What it does:
+// 1. Runs forever in a loop
+// 2. Calls bounded_buffer_pop() → blocks if nothing to consume
+// 3. When it gets an item → opens logs/<container_id>.log
+// 4. Writes the chunk to the file
+// 5. Exits when pop() returns -1 (shutdown signal)
+```
+
+This is the single consumer. One thread drains the buffer and writes to the correct log file based on `item.container_id`.
+
+**4. `child_fn()` — What runs INSIDE the container (clone entrypoint)**
+
+```c
+// What it does step by step:
+// 1. sethostname() → gives container its own hostname (uses UTS namespace)
+// 2. chroot(rootfs) → jails the process to rootfs-alpha/ — it thinks this IS root
+// 3. chdir("/") → move into the new root
+// 4. mount("proc", "/proc", "proc") → make ps/top work inside container
+// 5. nice(value) → set scheduling priority if specified
+// 6. dup2(log_write_fd, STDOUT) → redirect stdout into the pipe (goes to logging system)
+// 7. dup2(log_write_fd, STDERR) → redirect stderr into the pipe too
+// 8. execl("/bin/sh", "sh", "-c", command) → run the actual command
+```
+
+The `dup2` is key — it redirects the container's output INTO the pipe that the supervisor's producer thread reads from.
+
+**5. `pipe_reader_thread()` — Producer thread (one per container)**
+
+```c
+// What it does:
+// 1. Reads from pipe's read-end (container's stdout comes here via dup2)
+// 2. Packages data into a log_item_t struct (with container_id tagged)
+// 3. Calls bounded_buffer_push() to insert into the shared buffer
+// 4. Exits when read() returns 0 (container exited, pipe closed)
+```
+
+This is the producer. One producer thread per container. Multiple producers, one consumer (logging_thread).
+
+**6. `run_supervisor()` — The supervisor event loop**
+
+```c
+// What it does:
+// 1. Opens /dev/container_monitor → connects to kernel module via ioctl
+// 2. Creates UNIX socket at /tmp/mini_runtime.sock → binds + listens
+// 3. Installs SIGCHLD handler → handle_sigchld() reaps zombie children
+// 4. Starts logging_thread (the consumer)
+// 5. Loops: accept() → read control_request_t → switch(req.kind) → handle → write response
+
+// For CMD_RUN / CMD_START:
+//   - pipe() → create pipe
+//   - clone() with CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS → create isolated container
+//   - close write-end in parent
+//   - add container_record_t to metadata linked list (under mutex)
+//   - register PID with kernel module via ioctl
+//   - start pipe_reader_thread for this container
+
+// For CMD_PS:
+//   - lock metadata_lock, walk container linked list, build table string, unlock
+
+// For CMD_STOP:
+//   - find container by id, send SIGTERM, update state to STOPPED
+
+// For CMD_LOGS:
+//   - open logs/<id>.log, read contents, send back in response
+```
+
+**7. `handle_sigchld()` — Zombie prevention**
+
+```c
+// What it does:
+// Called automatically when ANY child exits
+// Loops: waitpid(-1, WNOHANG) until no more exited children
+//   → finds matching container_record in linked list
+//   → updates state to CONTAINER_EXITED
+//   → records exit code or exit signal
+// WNOHANG = don't block, return immediately if no child has exited yet
+// The while loop handles multiple children exiting at the same time
+```
+
+---
+
+## `monitor.c` — The Kernel Module
+
+This runs **inside the Linux kernel**. It has one job: watch RSS memory of container processes and enforce limits.
+
+### How it works overall
+
+```
+supervisor → ioctl(MONITOR_REGISTER) → kernel adds PID to linked list
+kernel timer fires every 1 second → reads RSS for each PID
+  if RSS > soft_limit → printk WARNING (once)
+  if RSS > hard_limit → send_sig(SIGKILL) → remove from list
+supervisor → ioctl(MONITOR_UNREGISTER) → kernel removes PID from list
+rmmod → module_exit → frees all list entries
+```
+
+### TODO Parts in `monitor.c`
+
+**TODO 1 — `struct monitored_entry` (the list node)**
+
+```c
+struct monitored_entry {
+    pid_t pid;                      // which process to watch
+    char container_id[64];          // name for printk messages
+    unsigned long soft_limit_bytes; // warning threshold
+    unsigned long hard_limit_bytes; // kill threshold
+    bool soft_warned;               // has warning already fired? (fires only ONCE)
+    struct list_head list;          // kernel's built-in linked list linkage
+};
+```
+
+**TODO 2 — Global list + mutex**
+
+```c
+static LIST_HEAD(monitored_list);   // kernel doubly-linked list head
+static DEFINE_MUTEX(monitored_lock); // protects all list operations
+```
+
+Why mutex not spinlock? The timer callback iterates the whole list which takes time. A spinlock disables preemption during the entire iteration. A mutex lets the scheduler context-switch during the wait — better for a 1Hz timer that's not in interrupt context.
+
+**TODO 4 — MONITOR_REGISTER handler**
+
+```c
+// What it does:
+// 1. kmalloc a new monitored_entry
+// 2. Copy pid, container_id, soft_limit, hard_limit from userspace req
+// 3. Set soft_warned = false
+// 4. mutex_lock → list_add_tail → mutex_unlock
+```
+
+`kmalloc(GFP_KERNEL)` = kernel-space memory allocation (like malloc but in kernel).
+
+**TODO 5 — MONITOR_UNREGISTER handler**
+
+```c
+// What it does:
+// 1. mutex_lock
+// 2. list_for_each_entry_safe → find entry matching pid AND container_id
+// 3. list_del + kfree → remove and free it
+// 4. mutex_unlock
+// 5. Return 0 if found, -ENOENT if not found
+```
+
+`list_for_each_entry_safe` — the `_safe` version is needed because we're deleting while iterating. Without `_safe`, deleting would corrupt the iterator pointer.
+
+**Timer callback — The core enforcement loop (already filled in)**
+
+```c
+// Fires every 1 second:
+// For each entry in monitored_list:
+//   rss = get_rss_bytes(pid)  → reads /proc/<pid>/mm RSS pages × PAGE_SIZE
+//   if rss < 0 → process already dead → remove entry
+//   printk RSS value (you saw this in your dmesg screenshots)
+//   if rss >= soft_limit AND not yet warned → log_soft_limit_event() → set soft_warned=true
+//   if rss >= hard_limit → kill_process() (sends SIGKILL) → remove entry
+// Reschedule timer: mod_timer(..., jiffies + HZ)  [HZ = ticks per second]
+```
+
+**TODO 6 — `monitor_exit()` cleanup**
+
+```c
+// What it does:
+// 1. del_timer_sync → stop the timer (sync = wait for any running callback to finish)
+// 2. mutex_lock → list_for_each_entry_safe → list_del + kfree each entry → mutex_unlock
+// 3. cdev_del, device_destroy, class_destroy, unregister_chrdev_region → unregister device
+// 4. printk "Module unloaded" → this is what you saw in your teardown screenshot ✅
+```
+
+---
+
+## One-Sentence Summary of Each File for Your Presentation
+
+**`engine.c`:** A user-space container runtime where the supervisor uses `clone()` with namespace flags to create isolated containers, pipes their output through a mutex-protected bounded buffer to a log file, and communicates with a CLI client over a UNIX domain socket.
+
+**`monitor.c`:** A Linux kernel module that registers a character device, maintains a mutex-protected linked list of monitored PIDs, and uses a 1Hz kernel timer to check each process's RSS — emitting a soft-limit warning once and sending SIGKILL when the hard limit is crossed.
+
+
+
+
+
+
+===================================================================================
+## Complete Run Guide — Your Project
+
+This assumes you're on **Ubuntu 22.04/24.04 VM** with Secure Boot OFF. Everything below uses your exact folder structure (`~/OS-Jackfruit/boilerplate/`).
+
+---
+
+### Step 1 — Install Dependencies
+
+```bash
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r)
+```
+
+---
+
+### Step 2 — Go to Your Project Folder
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+```
+
+---
+
+### Step 3 — Build Everything
+
+```bash
+make
+```
+
+This compiles `engine`, `cpu_hog`, `io_pulse`, `memory_hog`, and builds `monitor.ko`.
+
+Verify the files exist:
+```bash
+ls -l engine cpu_hog io_pulse memory_hog monitor.ko
+```
+
+---
+
+### Step 4 — Prepare the Root Filesystems
+
+```bash
+# Create base rootfs (only do this once)
+mkdir -p rootfs-base
+wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+
+# Create per-container copies
+cp -a rootfs-base rootfs-alpha
+cp -a rootfs-base rootfs-beta
+
+# Copy workload binaries INTO the rootfs (THIS is why you got execvp errors before)
+cp ./cpu_hog    ./rootfs-alpha/
+cp ./memory_hog ./rootfs-alpha/
+cp ./io_pulse   ./rootfs-beta/
+```
+
+> ⚠️ This step is exactly why you got `execvp failed: No such file or directory` in your screenshots — the binaries were not copied into the rootfs before launching containers.
+
+---
+
+### Step 5 — Load the Kernel Module
+
+```bash
+sudo insmod monitor.ko
+
+# Verify it loaded
+lsmod | grep monitor
+
+# Verify the device was created
+ls -l /dev/container_monitor
+```
+
+---
+
+### Step 6 — Open Two Terminals
+
+You need **Terminal 1** (supervisor) and **Terminal 2** (CLI commands). Keep them side by side.
+
+---
+
+### Terminal 1 — Start the Supervisor
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+sudo ./engine supervisor ./rootfs-base
+```
+
+Leave this running. You'll see:
+```
+✅ Supervisor running... waiting for commands
+```
+
+---
+
+### Terminal 2 — Run Everything From Here
+
+#### Launch two containers:
+```bash
+cd ~/OS-Jackfruit/boilerplate
+sudo ./engine run alpha ./rootfs-alpha "/cpu_hog" &
+sudo ./engine run beta  ./rootfs-beta  "/io_pulse" &
+```
+
+#### Check metadata (ps):
+```bash
+sudo ./engine ps
+```
+You should see both containers with ID, PID, STATE, TIME.
+
+#### Read logs:
+```bash
+sudo ./engine logs alpha
+```
+
+#### Stop containers:
+```bash
+sudo ./engine stop alpha
+sudo ./engine stop beta
+```
+
+---
+
+### Step 7 — Memory Limit Test (Fix for Screenshots 5 & 6)
+
+This is the most important fix. Run these commands **in order, exactly**:
+
+```bash
+# Terminal 2:
+sudo ./engine run memleak ./rootfs-alpha "/memory_hog" --soft-mib 20 --hard-mib 30 &
+
+# Wait 3 seconds
+sleep 3
+
+# THIS is the correct command - always use sudo
+sudo dmesg | tail -20
+```
+
+You should see lines like:
+```
+[kernel] SOFT LIMIT: container PID XXXX RSS exceeded 20 MiB
+[kernel] HARD LIMIT: sending SIGKILL to PID XXXX
+```
+
+Then immediately check:
+```bash
+sudo ./engine ps
+```
+The `memleak` container should show state `killed` or `exited`.
+
+> ⚠️ The reason your screenshots showed nothing from dmesg was `dmesg: read kernel buffer failed: Operation not permitted` — you forgot `sudo`. Always use `sudo dmesg`.
+
+---
+
+### Step 8 — Scheduling Experiment (Screenshot 7)
+
+```bash
+cd ~/OS-Jackfruit/boilerplate
+
+# Run both concurrently and time them
+time sudo ./engine run cpu1 ./rootfs-alpha "/cpu_hog" --nice 0  &
+time sudo ./engine run cpu2 ./rootfs-beta  "/cpu_hog" --nice 10 &
+wait
+```
+
+You'll see real-time differences between cpu1 and cpu2.
+
+---
+
+### Step 9 — Clean Teardown (Screenshot 8)
+
+```bash
+# Stop all containers
+sudo ./engine stop alpha
+sudo ./engine stop beta
+
+# Check no zombies (use this exact command, not ps auz)
+ps aux | grep engine
+
+# Kill the supervisor (Ctrl+C in Terminal 1, or:)
+sudo kill $(pgrep -f "engine supervisor")
+
+# Unload module (make sure no ioctl handles are open first)
+sudo rmmod monitor
+
+# Confirm clean unload - always with sudo
+sudo dmesg | tail -5
+```
