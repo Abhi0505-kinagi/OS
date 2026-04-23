@@ -9,7 +9,7 @@ A lightweight Linux container runtime in C with a long-running parent supervisor
 | Name | SRN |
 |------|-----|
 | ABHISHEK HANAMANT KINAGI | PES1UG24CS018 |
-| NISARG RAVI| PES1UG24CS901|
+| NISARG RAVI| PES1UG25CS901|
 
 ---
 
@@ -312,7 +312,7 @@ wait
 | cpu1      | 0          | 0m0.048s  | 0m0.002s  | 0m0.011s |
 | cpu2      | 10         | 0m0.083s  | 0m0.005s  | 0m0.009s |
 
-### Analysis
+#### Analysis
 
 `cpu1` (nice=0) finished in 0.048s real time; `cpu2` (nice=10) took 0.083s — approximately 1.7× slower. The Linux CFS scheduler assigns weights based on nice values: nice=0 gets weight 1024, nice=10 gets weight 110. When both are runnable, the scheduler allocates CPU time in proportion to their weights (~9:1 ratio theoretically).
 
