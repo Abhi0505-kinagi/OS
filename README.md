@@ -8,8 +8,8 @@ A lightweight Linux container runtime in C with a long-running parent supervisor
 
 | Name | SRN |
 |------|-----|
-| Abhishek | PES1UG24CS018 |
-| Nisarg Ravi| PES1UG24CS901|
+| ABHISHEK HANAMANT KINAGI | PES1UG24CS018 |
+| NISARG RAVI| PES1UG24CS901|
 
 ---
 
